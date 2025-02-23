@@ -20,6 +20,7 @@ class Value(nn.Module):
         for i in layers:
             if isinstance(i, nn.Linear):
                 nn.init.kaiming_normal_(i.weight)
+                nn.init.zeros_(i.bias)
                 
         self.net = nn.Sequential(*layers)
 

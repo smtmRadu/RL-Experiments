@@ -1,27 +1,23 @@
 
 
 import os
-import time
 from datetime import datetime
 
 os.environ['CUDA_LAUNCH_BLOCKING']="1"
 os.environ['TORCH_USE_CUDA_DSA'] = "1"
 
 import gymnasium as gym
-from policy import Policy
-from value import Value
+from networks.policy import Policy
+from networks.value import Value
+from normalizers.running_normalizer import RunningNormalizer                
+from normalizers.rewards_normalizer import RewardsNormalizer
 from torch.distributions import Categorical, Independent, Normal
 import torch
 import torch.nn.functional as F
 from flashml.info.rl import log_episode, display_episodes
-from running_normalizer import RunningNormalizer
-from rewards_normalizer import RewardsNormalizer
+
 from optimi import StableAdamW
 
-# I found out why the ppo becomes slower after some training.
-# the overhead problem is in GAE implementation
-# When the agent becomes better, it has larger episodes so longer for loops
-# or just decrease horizon..
 class PPO():
     '''
     automatic PPO trainer
@@ -42,9 +38,6 @@ class PPO():
             max_norm:float=0.5,
             lam:float=0.97,
             beta:float= 5e-3, # entropy bonus coeff
-
-            max_episode_len=1000,
-            horizon:int=1024,
             
             networks_dims = (2, 64), #layers/hidden
             state_and_reward_clipping = 5.0,       
@@ -58,7 +51,7 @@ class PPO():
         torch.manual_seed(seed=seed)
         torch.cuda.manual_seed_all(seed=seed)
 
-        self.env = gym.make(env_name, max_episode_steps=max_episode_len)
+        self.env = gym.make(env_name)
 
         if isinstance(self.env.action_space, gym.spaces.Box):
             self.action_space = "continuous"
@@ -80,13 +73,12 @@ class PPO():
         self.pi_optim = StableAdamW(self.pi.parameters(), lr=pi_lr)
         self.v_optim = StableAdamW(self.v.parameters(), lr=vf_lr)
         self.state_normalizer = RunningNormalizer(self.state_dim, device='cpu')     
-        self.rewards_normalizer = RewardsNormalizer(device='cpu')
+        self.rewards_normalizer = RewardsNormalizer(gamma=gamma, device='cpu')
         self.max_steps = max_steps
         self.buffer_size = buffer_size
         self.gamma = gamma
         self.lam = lam
         self.beta = beta
-        self.horizon=horizon
         self.clip_epsilon = clip_epsilon
         self.max_norm = max_norm
         self.num_epoch = num_epoch
@@ -101,8 +93,8 @@ class PPO():
         norm_clip_state = norm_state.clip(-self.state_and_reward_clipping, self.state_and_reward_clipping)
         return norm_clip_state
     
-    def normalize_and_clip_reward(self, reward:torch.Tensor, dones:torch.Tensor, global_step:int) -> torch.Tensor:
-        norm_reward = self.rewards_normalizer.normalize(reward, dones, global_step=global_step)
+    def normalize_and_clip_reward(self, reward:torch.Tensor, dones:torch.Tensor) -> torch.Tensor:
+        norm_reward = self.rewards_normalizer.normalize(reward, dones)
         norm_clip_reward = norm_reward.clip(-self.state_and_reward_clipping, self.state_and_reward_clipping)
         return norm_clip_reward
     
@@ -191,15 +183,15 @@ class PPO():
                 done = torch.ones(1) if STEP_n[2] or STEP_n[3] else torch.zeros(1)
                 next_state = torch.tensor(STEP_n[0], dtype=torch.float32)
                 
+                
                 # normalize
                 next_state = self.normalize_and_clip_state(next_state, True)
-                reward = self.normalize_and_clip_reward(reward, done, steps_COUNT)
-
+                normalized_reward = self.normalize_and_clip_reward(reward, done)
                 # update current tstep data
                 buffer.actions[timestep_] = action if self.action_space == "continuous" else F.one_hot(action, self.action_dim)
                 buffer.log_probs[timestep_] = log_probs
                 buffer.next_states[timestep_] = next_state
-                buffer.rewards[timestep_] = reward
+                buffer.rewards[timestep_] = normalized_reward
                 buffer.dones[timestep_] = done
                 episode_rewards.append(reward.item())
 
@@ -232,31 +224,18 @@ class PPO():
             steps_COUNT = steps
             episodes_COUNT = episodes
 
-           # Here overhead to solve if possible. Probably multithreading.... or with removal of horizon.
             # Compute Rewards-to-go ----------------------------------------------------------------------------------------------------
             self.v.to(self.device)
             self.pi.to(self.device)
             with torch.no_grad():
                 values_plus_1 = self.v(torch.concat([buffer.states, buffer.next_states[-1:, :]], dim=0).to(self.device)).cpu() # T+1, 1
                 buffer.values = values_plus_1[:-1]
-                
-                for timestep_ in range(buffer.values.size(0)):
-                    discount = 1.0
-                    ahat_t = 0.0
-                    for i in range(timestep_, buffer.values.size(0)):
-                        r_t = buffer.rewards[i]
-                        V_targ_batch = values_plus_1[i]
-                        v_next_t = 0.0 if buffer.dones[i].item() == 1 else values_plus_1[i+1]
-                        delta = r_t + self.gamma * v_next_t - V_targ_batch
-                        ahat_t += discount * delta
-                        discount *= self.gamma * self.lam
-                        if buffer.dones[i].item() == 1:
-                            break
-                        if i + 1 == min(timestep_+ self.horizon, buffer.values.size(0)):
-                            break
-                        
-                    buffer.value_targets[timestep_] = ahat_t + buffer.values[timestep_]
-                    buffer.advantages[timestep_] = ahat_t
+                gae = torch.zeros(1) # on parallel it must be tensor (num_envs, 1)
+                for timestep_ in reversed(range(buffer.values.size(0) - 1)):
+                    delta = buffer.rewards[timestep_] + self.gamma * values_plus_1[timestep_+1] * (1 - buffer.dones[timestep_]) - values_plus_1[timestep_]
+                    gae = delta + self.gamma * self.lam * (1 - buffer.dones[timestep_]) * gae
+                    buffer.advantages[timestep_] = gae.item()
+                    buffer.value_targets[timestep_] = gae.item() + buffer.values[timestep_].item()
 
             # Update policy -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- 
             buffer.move_to(self.device)
@@ -296,16 +275,14 @@ class PPO():
                     self.pi_optim.zero_grad()
                     full_loss.backward()
                     self.v_optim.step()
-                    self.pi_optim.step() # step is the problem overhead, verified really strong
+                    self.pi_optim.step()
 
         print()
         self._make_checkpoint()
         display_episodes()
 
     def test(self):
-        # self._load_checkpoint() this is already done on creation of the ppo object.
-
-        test_env = gym.make(self.env.spec.id, render_mode="human")  # Create a new env instance with rendering enabled
+        test_env = gym.make(self.env.spec.id, render_mode="human")
 
         self.pi.cpu()
         self.v.cpu()
@@ -340,11 +317,11 @@ class PPO():
                 step_result = test_env.step(scaled_action)
 
                 if len(step_result) == 5:
-                    next_obs, reward, done_flag, truncated, info = step_result
+                    next_obs, reward, done_flag, truncated, _ = step_result
                     done = done_flag or truncated
 
                 else:
-                    next_obs, reward, done, info = step_result
+                    next_obs, reward, done, _= step_result
 
                 episode_reward += float(reward)
                 next_state = torch.tensor(next_obs, dtype=torch.float32)

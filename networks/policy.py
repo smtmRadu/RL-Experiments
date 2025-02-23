@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Tuple
 
 from flashml.modules.Rish import Rish
@@ -24,6 +23,7 @@ class Policy(nn.Module):
         for i in layers:
             if isinstance(i, nn.Linear):
                 nn.init.kaiming_normal_(i.weight)
+                nn.init.zeros_(i.bias)
                 
         self.net = nn.Sequential(*layers)
 

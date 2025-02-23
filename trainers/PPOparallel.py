@@ -1,26 +1,21 @@
 
 
 import os
-
+from datetime import datetime
 os.environ['CUDA_LAUNCH_BLOCKING']="1"
 os.environ['TORCH_USE_CUDA_DSA'] = "1"
 
 import gymnasium as gym
-from policy import Policy
-from value import Value
-from torch.optim import Adam, AdamW
-from torch.distributions import MultivariateNormal, Categorical, Independent, Normal
+from networks.policy import Policy
+from networks.value import Value
+from normalizers.running_normalizer import RunningNormalizer
+from normalizers.rewards_normalizer import RewardsNormalizer
+from torch.distributions import Categorical, Independent, Normal
 import torch
 import torch.nn.functional as F
-import math
-from flashml.info import log_metrics, display_metrics
 from flashml.info.rl import log_episode, display_episodes
-from tqdm import tqdm
-from running_normalizer import RunningNormalizer
-from torchinfo import summary
-import inspect
+
 from optimi import StableAdamW
-from stable_baselines3.common.vec_env import VecEnv, DummyVecEnv
 
 
 # This is not done yet. I remained at gae computation
@@ -45,11 +40,7 @@ class PPO():
             max_norm:float=0.5,
             lam:float=0.97,
             beta:float= 5e-3, # entropy bonus coeff
-            target_kl=1e-2,
 
-            max_episode_len=1000,
-            horizon:int=1024,
-            
             networks_dimensions = (2, 64),
             state_clipping = 5.0,       
     ):
@@ -61,7 +52,7 @@ class PPO():
         torch.manual_seed(seed=seed)
         torch.cuda.manual_seed_all(seed=seed)
 
-        self.envs = gym.make_vec(env_name, num_envs=num_envs, max_episode_steps=max_episode_len)
+        self.envs = gym.make_vec(env_name, num_envs=num_envs)
     
         if isinstance(self.envs.action_space, gym.spaces.Box):
             self.action_space = "continuous"
@@ -81,30 +72,35 @@ class PPO():
 
         self.pi = Policy(self.state_dim, self.action_dim, self.action_space, networks_dimensions[0], networks_dimensions[1]).to(self.device)
         self.v = Value(self.state_dim, networks_dimensions[0], networks_dimensions[1]).to(self.device)
-        self.pi_optim = Adam(self.pi.parameters(), lr=pi_lr)
-        self.v_optim = Adam(self.v.parameters(), lr=vf_lr)
+        self.pi_optim = StableAdamW(self.pi.parameters(), lr=pi_lr)
+        self.v_optim = StableAdamW(self.v.parameters(), lr=vf_lr)
         self.state_normalizer = RunningNormalizer(self.state_dim, device=self.device)
-
+        self.rewards_normalizer = RewardsNormalizer(gamma=gamma, device=self.device)
         self.max_steps = max_steps
         self.relative_buffer_size = buffer_size // self.envs.num_envs
         self.gamma = gamma
         self.lam = lam
         self.beta = beta
-        self.horizon=horizon
         self.clip_epsilon = clip_epsilon
         self.max_norm = max_norm
         self.num_epoch = num_epoch
         self.batch_size = batch_size
-        self.state_clip = state_clipping
+        self.state_and_reward_clipping = state_clipping
 
         self.last_observation_input:torch.Tensor = None # normalized s
+        self._load_checkpoint()
+
 
     def normalize_and_clip_state(self, state:torch.Tensor, update_online_normalizer:bool) -> torch.Tensor:
         if update_online_normalizer:
             self.state_normalizer.update(state)
         norm_state = self.state_normalizer.normalize(state)
-        norm_clip_state = norm_state.clip(-self.state_clip, self.state_clip)
+        norm_clip_state = norm_state.clip(-self.state_and_reward_clipping, self.state_and_reward_clipping)
         return norm_clip_state
+    def normalize_and_clip_reward(self, reward:torch.Tensor, dones:torch.Tensor,) -> torch.Tensor:
+        norm_reward = self.rewards_normalizer.normalize(reward, dones)
+        norm_clip_reward = norm_reward.clip(-self.state_and_reward_clipping, self.state_and_reward_clipping)
+        return norm_clip_reward
     
     def scale_actions_for_environment(self, action:torch.Tensor):
         if self.action_space != "continuous":
@@ -137,20 +133,23 @@ class PPO():
                     raise "Bro I did not implemented for Multivariate Discrete environments"
 
                 actions_parallel_batch = _dist.sample()
-                log_probs_parallel_batch = _dist.log_prob(actions_parallel_batch)
+                log_probs_parallel_batch = _dist.log_prob(actions_parallel_batch).unsqueeze(-1)
                 # Take action and unpack data
                 STEPS_batch = self.envs.step(self.scale_actions_for_environment(actions_parallel_batch).cpu().numpy()) # new state, reward, done, _ 
-                rewards_parallel_batch = torch.tensor(STEPS_batch[1], dtype=torch.float32, device=self.device)  
-                dones_parallel_batch = torch.tensor(STEPS_batch[2], dtype=torch.float32, device=self.device)
+                rewards_parallel_batch = torch.tensor(STEPS_batch[1], dtype=torch.float32, device=self.device).unsqueeze(-1)  
+                dones_parallel_batch = torch.tensor(STEPS_batch[2], dtype=torch.float32, device=self.device).unsqueeze(-1)
                 next_states_parallel_batch = torch.tensor(STEPS_batch[0], dtype=torch.float32, device=self.device)
+                
+                
                 next_states_parallel_batch = self.normalize_and_clip_state(next_states_parallel_batch, True)
+                normalized_reward_batch = self.normalize_and_clip_reward(rewards_parallel_batch, dones_parallel_batch)
 
                 # update current tstep data
                 buffer.actions[timestep_] = actions_parallel_batch if self.action_space == "continuous" else F.one_hot(actions_parallel_batch, self.action_dim)
-                buffer.log_probs[timestep_] = log_probs_parallel_batch.unsqueeze(-1)
+                buffer.log_probs[timestep_] = log_probs_parallel_batch
                 buffer.next_states[timestep_] = next_states_parallel_batch
-                buffer.rewards[timestep_] = rewards_parallel_batch.unsqueeze(-1)
-                buffer.dones[timestep_] = dones_parallel_batch.unsqueeze(-1)
+                buffer.rewards[timestep_] = normalized_reward_batch
+                buffer.dones[timestep_] = dones_parallel_batch
 
                 for i in range(self.envs.num_envs):
                     episode_rewards[i].append(rewards_parallel_batch[i].item())
@@ -190,37 +189,26 @@ class PPO():
            
             # Compute Rewards-to-go ----------------------------------------------------------------------------------------------------
             with torch.no_grad():
-                values_plus_1 = self.v(torch.concat([buffer.states, buffer.next_states[-1:, :]], dim=0).to(self.device)).cpu() # T+1, 1
-                buffer.values = values_plus_1[:-1]
+                values_plus_1 = self.v(torch.concat([buffer.states, buffer.next_states[-1:, ...]], dim=0).to(self.device)) # T+1, 1
+                buffer.values = values_plus_1[:-1, ...] # (Buff/Env, Env, 1)
                 
-                for timestep_ in range(buffer.values.size(0)):
-                    discount = 1.0
-                    ahat_t = 0.0
-                    for i in range(timestep_, buffer.values.size(0)):
-                        r_t = buffer.rewards[i]
-                        V_targ_batch = values_plus_1[i]
-                        v_next_t = 0.0 if buffer.dones[i].item() == 1 else values_plus_1[i+1]
-                        delta = r_t + self.gamma * v_next_t - V_targ_batch
-                        ahat_t += discount * delta
-                        discount *= self.gamma * self.lam
-                        if buffer.dones[i].item() == 1:
-                            break
-                        if i + 1 == min(timestep_+ self.horizon, buffer.values.size(0)):
-                            break
-                        
-                    buffer.value_targets[timestep_] = ahat_t + buffer.values[timestep_]
-                    buffer.advantages[timestep_] = ahat_t
+                gae = torch.zeros(self.envs.num_envs, 1, device=self.device)
+                for timestep_ in reversed(range(buffer.values.size(0) - 1)):
+                    delta = buffer.rewards[timestep_] + self.gamma * values_plus_1[timestep_+1] * (1 - buffer.dones[timestep_]) - values_plus_1[timestep_]
+                    gae = delta + self.gamma * self.lam * (1 - buffer.dones[timestep_]) * gae
+                    buffer.advantages[timestep_] = gae
+                    buffer.value_targets[timestep_] = gae + buffer.values[timestep_]
 
-            # Todo - verify where the fuck is the overhead, from tests it seems like it appears here
             # Update policy -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- 
             for k in range(self.num_epoch):
-                num_batches = self.buffer_size // self.batch_size
-                random_batch_permutations = torch.randperm(self.buffer_size, device=self.device)
+                BUFFER_SIZE = self.relative_buffer_size * self.envs.num_envs
+                num_batches = BUFFER_SIZE // self.batch_size
+                random_batch_permutations = torch.randperm(BUFFER_SIZE, device=self.device)
                 for i in range(num_batches):
                     batch_idxs = random_batch_permutations[i * self.batch_size: (i+1) * self.batch_size]
-                    s_batch = buffer.states[batch_idxs].detach()
+                    s_batch = buffer.states.view(BUFFER_SIZE,-1)[batch_idxs].detach()
 
-                    V_targ_batch = buffer.value_targets[batch_idxs].detach()
+                    V_targ_batch = buffer.value_targets.view(BUFFER_SIZE,-1)[batch_idxs].detach()
                     v_hat = self.v.forward(s_batch)
                     v_loss = 0.5 * (V_targ_batch - v_hat)**2
 
@@ -228,36 +216,83 @@ class PPO():
                         mu, log_std = self.pi.forward(s_batch)
                         log_std = torch.clip(log_std, -3, 3)
                         _dist = Independent(Normal(mu, log_std.exp()), reinterpreted_batch_ndims=1)
-                        log_pi_batch:torch.Tensor = _dist.log_prob(buffer.actions[batch_idxs].detach()).view(-1, 1) # (B, 1)
+                        log_pi_batch:torch.Tensor = _dist.log_prob(buffer.actions.view(BUFFER_SIZE,-1)[batch_idxs].detach()).view(-1, 1) # (B, 1)
                     
                     elif self.action_space == "discrete":
                         log_probs = self.pi.forward(s_batch)
                         _dist = Categorical(logits=log_probs)
-                        log_pi_batch:torch.Tensor = _dist.log_prob(torch.argmax(buffer.actions[batch_idxs], dim=-1, keepdim=True).squeeze(-1)).view(-1, 1) # (B, 1)      
+                        log_pi_batch:torch.Tensor = _dist.log_prob(torch.argmax(buffer.actions.view(BUFFER_SIZE,-1)[batch_idxs], dim=-1, keepdim=True).squeeze(-1)).view(-1, 1) # (B, 1)      
                     else:
                         raise "what the fuck"
                     
-                    log_pi_old_batch = buffer.log_probs[batch_idxs].detach()# (B, 1)
+                    log_pi_old_batch = buffer.log_probs.view(BUFFER_SIZE,-1)[batch_idxs].detach()# (B, 1)
                     entropy_batch = _dist.entropy()
  
                     r = torch.exp(log_pi_batch - log_pi_old_batch)
 
-                    A_batch = buffer.advantages[batch_idxs]
+                    A_batch = buffer.advantages.view(BUFFER_SIZE,-1)[batch_idxs]
                     full_loss = -torch.min(r * A_batch, torch.clip(r, 1-self.clip_epsilon, 1+self.clip_epsilon) * A_batch) - self.beta * entropy_batch + v_loss
                     full_loss = full_loss.mean()
                     self.v_optim.zero_grad()
                     self.pi_optim.zero_grad()
                     full_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.v.parameters(), max_norm=self.max_norm)
-                    torch.nn.utils.clip_grad_norm_(self.pi.parameters(), max_norm=self.max_norm)
                     self.v_optim.step()
-                    self.pi_optim.step() # step is the problem overhead, verified really strong
+                    self.pi_optim.step()
 
         print()
-        self._make_checkpoint(0)
+        self._make_checkpoint()
         display_episodes()
 
-    def _make_checkpoint(self, idx:int):
+    def test(self):
+        test_env = gym.make(self.envs.spec.id, render_mode="human")
+        
+        episode_idx_count = 0
+        # Run test episodes
+        while True:
+            obs, _ = test_env.reset()
+            state = torch.tensor(obs, dtype=torch.float32, device= self.device)
+            state = self.normalize_and_clip_state(state, update_online_normalizer=False)
+            episode_reward = 0.0
+            episode_len = 0
+            done = False
+            episode_idx_count += 1
+
+            while not done:
+                test_env.render()
+
+                with torch.no_grad():
+                    if self.action_space == "continuous":
+                        mu, log_std = self.pi.forward(state)
+                        log_std = torch.clamp(log_std, -3, 3)
+                        _dist = Independent(Normal(mu, log_std.exp()), 1)
+                    elif self.action_space == "discrete":
+                        logits = self.pi.forward(state)
+                        _dist = Categorical(logits=logits)
+                    else:
+                        raise NotImplementedError("Test not implemented for this action space.")
+
+                    action = _dist.sample()
+
+                scaled_action = self.scale_actions_for_environment(action).cpu().numpy()[-1] # action range is in shape (ENVS, A), so this is batched
+                step_result = test_env.step(scaled_action)
+
+                if len(step_result) == 5:
+                    next_obs, reward, done_flag, truncated, _ = step_result
+                    done = done_flag or truncated
+
+                else:
+                    next_obs, reward, done, _= step_result
+
+                episode_reward += float(reward)
+                next_state = torch.tensor(next_obs, dtype=torch.float32, device=self.device)
+                next_state = self.normalize_and_clip_state(next_state, update_online_normalizer=False)
+                state = next_state
+                episode_len += 1
+
+            print(f"[Test] Episode {episode_idx_count} [Cumulated Reward: {episode_reward}] [Episode Length: {episode_len}]")
+
+
+    def _make_checkpoint(self):
         if not os.path.exists("./checkpoints"):
             os.mkdir("./checkpoints")
 
@@ -267,17 +302,44 @@ class PPO():
         if not os.path.exists(f"./checkpoints/{__name__}/{self.envs.spec.id}"):
             os.mkdir(f"./checkpoints/{__name__}/{self.envs.spec.id}")
 
+        ckp_code = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         torch.save(
             {
-                "pi":self.pi.state_dict(),
-                "v":self.v.state_dict(),
-                "pi_optim":self.pi.state_dict(),
-                "v_optim":self.v_optim.state_dict(),
+                "pi":self.pi,
+                "v":self.v,
+                "pi_optim":self.pi_optim,
+                "v_optim":self.v_optim,
+                "state_normalizer":self.state_normalizer,
             },
-            f= f"./checkpoints/{__name__}/{self.envs.spec.id}/checkpoint_{idx}.pth"
+            f= f"./checkpoints/{__name__}/{self.envs.spec.id}/checkpoint_{ckp_code}.pth"
         )
-        print(f"Checkpoint {idx} done (./checkpoints/{__name__}/{self.envs.spec.id})")
+        print(f"Checkpoint {ckp_code} saved (./checkpoints/{__name__}/{self.envs.spec.id})")
 
+    def _load_checkpoint(self):
+        if not os.path.exists("./checkpoints"):
+            os.mkdir("./checkpoints")
+        
+        if not os.path.exists(f"./checkpoints/{__name__}"):
+            os.mkdir(f"./checkpoints/{__name__}")
+
+        if not os.path.exists(f"./checkpoints/{__name__}/{self.envs.spec.id}"):
+            os.mkdir(f"./checkpoints/{__name__}/{self.envs.spec.id}")
+
+        path = f"./checkpoints/{__name__}/{self.envs.spec.id}"
+        checkpoint_files = [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))]
+        
+        if not checkpoint_files:
+            return
+
+        latest_checkpoint = sorted(checkpoint_files)[-1]
+        checkpoint_path = os.path.join(path, latest_checkpoint)
+        checkpoint = torch.load(checkpoint_path, weights_only=False)
+        self.pi = checkpoint["pi"]
+        self.v = checkpoint["v"]
+        self.pi_optim = checkpoint["pi_optim"]
+        self.v_optim = checkpoint["v_optim"]
+        self.state_normalizer = checkpoint["state_normalizer"]
+        print(f"Checkpoint loaded: ({latest_checkpoint})")
         
 class Buffer:
     def __init__(self, dim:int, envs_num:int, state_dim:int, action_dim:int, device) -> None:

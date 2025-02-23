@@ -14,7 +14,7 @@ class RunningNormalizer(nn.Module):
         if self.step == 0:
             raise "Update before normalizing sir"
         if self.step <= 1:
-            return torch.full(x.shape, 1e-8)
+            return torch.clone(x)
         
         variance = self.m2 / (self.step - 1)
         variance[variance == 0] = 1
