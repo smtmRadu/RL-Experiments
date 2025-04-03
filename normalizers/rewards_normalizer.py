@@ -18,6 +18,9 @@ class RewardsNormalizer(nn.Module):
         parallel_rewards: (Env, 1) or (1)
         parallel_dones: (Env, 1) or (1)
         '''
+        # assert parallel_rewards.size(-1) == 1, f"Parallel Rewards shape must be (Envs_num, 1) or (1) (received: {tuple(parallel_rewards.shape)})"
+        # assert parallel_dones.size(-1) == 1, f"Parallel Dones shape must be (Envs_num, 1) or (1) (received: {tuple(parallel_dones.shape)})"
+        
         if self._returns is None: # adapt tensor to size of parallel envs
             self._returns = torch.zeros(parallel_rewards.numel(),1, device=self.device) # keep it like this unsqueezed
 

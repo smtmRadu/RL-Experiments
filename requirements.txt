@@ -1,0 +1,7 @@
+# Note this is a local install of flashml, not PyPI packages
+flashml.egg==info
+gymnasium==1.0.0
+torch==2.6.0+cu126
+torch_optimi==0.2.1
+torchinfo==1.8.0
+tqdm==4.66.5

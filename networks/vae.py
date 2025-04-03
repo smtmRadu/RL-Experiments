@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from flashml.modules import Rish
 
 class VAE(nn.Module):
     def __init__(self, state_dim:int, latent_dim:int) -> None:
@@ -16,7 +16,7 @@ class VAE(nn.Module):
         self.up1 = nn.Linear(latent_dim, (state_dim + latent_dim) * 1 /3)
         self.up2 = nn.Linear((state_dim + latent_dim) * 1 /3, (state_dim + latent_dim) * 2 /3)
         self.out = nn.Linear((state_dim + latent_dim) * 2 /3, state_dim)
-        
+        self.rish = Rish()
 
         # Init
         torch.nn.init.kaiming_normal_(self.down1.weight)
@@ -28,15 +28,15 @@ class VAE(nn.Module):
         torch.nn.init.kaiming_normal_(self.out.weight)
 
     def encode(self, x:torch.Tensor):
-        x = F.silu(self.down1(x))
-        x = F.silu(self.down2(x))
+        x = self.rish(self.down1(x))
+        x = self.rish(self.down2(x))
         mu = self.mu(x)
         logvar = self.logvar(x)
         return mu, logvar
     
     def decode(self, z:torch.Tensor) -> torch.Tensor:
-        x = F.silu(self.up1(z))
-        x = F.silu(self.up2(x))
+        x = self.rish(self.up1(z))
+        x = self.rish(self.up2(x))
         x = self.out(x)
 
     def forward(self, x:torch.Tensor) -> tuple[torch.tensor, torch.tensor, torch.tensor, torch.tensor]:

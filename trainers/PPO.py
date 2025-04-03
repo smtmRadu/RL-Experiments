@@ -14,7 +14,8 @@ from normalizers.rewards_normalizer import RewardsNormalizer
 from torch.distributions import Categorical, Independent, Normal
 import torch
 import torch.nn.functional as F
-from flashml.info.rl import log_episode, display_episodes
+from flashml.tools.rl import log_episode, display_episodes
+from torch.optim.lr_scheduler import LinearLR
 
 from optimi import StableAdamW
 
@@ -38,7 +39,8 @@ class PPO():
             max_norm:float=0.5,
             lam:float=0.97,
             beta:float= 5e-3, # entropy bonus coeff
-            
+            lr_annealing:bool=True,
+
             networks_dims = (2, 64), #layers/hidden
             state_and_reward_clipping = 5.0,       
     ):
@@ -72,6 +74,9 @@ class PPO():
         self.v = Value(self.state_dim, networks_dims[0], networks_dims[1])
         self.pi_optim = StableAdamW(self.pi.parameters(), lr=pi_lr)
         self.v_optim = StableAdamW(self.v.parameters(), lr=vf_lr)
+        self.lr_scheduler_pi = LinearLR(self.pi_optim, start_factor=1, end_factor=0, total_iters=max_steps // buffer_size * num_epoch * buffer_size // batch_size)
+        self.lr_scheduler_v = LinearLR(self.v_optim, start_factor=1, end_factor=0, total_iters=max_steps // buffer_size * num_epoch * buffer_size // batch_size)
+        self.lr_anneal = lr_annealing
         self.state_normalizer = RunningNormalizer(self.state_dim, device='cpu')     
         self.rewards_normalizer = RewardsNormalizer(gamma=gamma, device='cpu')
         self.max_steps = max_steps
@@ -84,6 +89,7 @@ class PPO():
         self.num_epoch = num_epoch
         self.batch_size = batch_size
         self.state_and_reward_clipping = state_and_reward_clipping
+        
         self._load_checkpoint()
 
     def normalize_and_clip_state(self, state:torch.Tensor, update_online_normalizer:bool) -> torch.Tensor:
@@ -121,7 +127,10 @@ class PPO():
                 "v":self.v,
                 "pi_optim":self.pi_optim,
                 "v_optim":self.v_optim,
+                "lr_scheduler_pi": self.lr_scheduler_pi,
+                "lr_scheduler_v": self.lr_scheduler_v,
                 "state_normalizer":self.state_normalizer,
+                "rewards_normalizer":self.rewards_normalizer,
             },
             f= f"./checkpoints/{__name__}/{self.env.spec.id}/checkpoint_{ckp_code}.pth"
         )
@@ -150,7 +159,10 @@ class PPO():
         self.v = checkpoint["v"]
         self.pi_optim = checkpoint["pi_optim"]
         self.v_optim = checkpoint["v_optim"]
+        self.lr_scheduler_pi = checkpoint["lr_scheduler_pi"]
+        self.lr_scheduler_v = checkpoint["lr_scheduler_v"]
         self.state_normalizer = checkpoint["state_normalizer"]
+        self.rewards_normalizer = checkpoint["rewards_normalizer"]
         print(f"Checkpoint loaded: ({latest_checkpoint})")
 
 
@@ -200,7 +212,8 @@ class PPO():
                     next_state = torch.tensor(self.env.reset()[0], dtype=torch.float32)
                     next_state = self.normalize_and_clip_state(next_state, True)
                     
-                    log_episode(sum(episode_rewards), episode_length=len(episode_rewards), step=(steps_COUNT, self.max_steps))
+                    log_episode(sum(episode_rewards), episode_length=len(episode_rewards), step=(steps_COUNT, self.max_steps), 
+                                other_metrics= {"Policy LR" : self.lr_scheduler_pi.get_last_lr(), "Value LR" : self.lr_scheduler_v.get_last_lr()})
 
                     episodes_COUNT += 1
                     episode_rewards.clear()
@@ -239,7 +252,7 @@ class PPO():
 
             # Update policy -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- 
             buffer.move_to(self.device)
-            for k in range(self.num_epoch):
+            for _ in range(self.num_epoch):
                 num_batches = self.buffer_size // self.batch_size
                 random_batch_permutations = torch.randperm(self.buffer_size, device=self.device)
                 for i in range(num_batches):
@@ -276,6 +289,10 @@ class PPO():
                     full_loss.backward()
                     self.v_optim.step()
                     self.pi_optim.step()
+
+                    if self.lr_anneal:
+                        self.lr_scheduler_pi.step()
+                        self.lr_scheduler_v.step()
 
         print()
         self._make_checkpoint()
