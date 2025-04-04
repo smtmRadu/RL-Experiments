@@ -16,7 +16,8 @@ import torch
 import torch.nn.functional as F
 from flashml.tools.rl import log_episode, display_episodes
 from torch.optim.lr_scheduler import LinearLR
-
+import random
+import numpy as np
 from optimi import StableAdamW
 
 class PPO():
@@ -47,11 +48,17 @@ class PPO():
         assert buffer_size % batch_size == 0, "Batch size must divide buffer size"
 
 
-        torch.backends.cudnn.benchmark = True
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        
-        torch.manual_seed(seed=seed)
-        torch.cuda.manual_seed_all(seed=seed)
+        self.device = "cpu"
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        random.seed(seed)   
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False  
+        torch.backends.cudnn.deterministic = True
 
         self.env = gym.make(env_name)
 
@@ -213,7 +220,7 @@ class PPO():
                     next_state = self.normalize_and_clip_state(next_state, True)
                     
                     log_episode(sum(episode_rewards), episode_length=len(episode_rewards), step=(steps_COUNT, self.max_steps), 
-                                other_metrics= {"Policy LR" : self.lr_scheduler_pi.get_last_lr(), "Value LR" : self.lr_scheduler_v.get_last_lr()})
+                                other_metrics= {"Policy LR" : self.lr_scheduler_pi.get_last_lr(), "Value LR" : self.lr_scheduler_v.get_last_lr(), __name__: self.envs.spec.id})
 
                     episodes_COUNT += 1
                     episode_rewards.clear()
@@ -351,7 +358,7 @@ class PPO():
         
 class Buffer:
     def __init__(self, dim:int, state_dim:int, action_dim:int) -> None:
-        self.states =        torch.zeros(dim, state_dim)
+        self.states =        torch.zeros(dim, state_dim, requires_grad=False)
         self.next_states =   torch.zeros(dim, state_dim)
         self.actions =       torch.zeros(dim, action_dim)
         self.log_probs =     torch.zeros(dim, 1)

@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from flashml.tools.rl import log_episode, display_episodes
 from optimi import StableAdamW
 from flashml.tools import OrnsteinUhlenbeckProcess
+import random
+import numpy as np
 class Buffer:
     def __init__(self, max_size, state_dim, action_dim):
         self.s = torch.zeros(max_size, state_dim, requires_grad=False)
@@ -51,10 +53,17 @@ class DDPG():
             state_clipping = 3.0,       
     ):
         assert batch_size < init_steps * 5, "You must collect steps at first before updating policy"
-        torch.backends.cudnn.benchmark = True
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        torch.manual_seed(seed=seed)
-        torch.cuda.manual_seed_all(seed=seed)
+        self.device = "cpu"
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        random.seed(seed)   
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False  
+        torch.backends.cudnn.deterministic = True
 
         self.env = gym.make(env_name)
 
@@ -89,7 +98,6 @@ class DDPG():
         for param in self.target_q.parameters():
             param.requires_grad = False
 
-        self.ou_noise = OrnsteinUhlenbeckProcess(self.action_dim, theta=0.15, sigma=act_noise)
         self.pi_optim = StableAdamW(self.pi.parameters(), lr=lr, weight_decay=0)
         self.q_optim = StableAdamW(self.q.parameters(), lr=lr, weight_decay=0)
         self.max_steps = max_steps
@@ -137,7 +145,7 @@ class DDPG():
                     sum(episode_rewards), 
                     episode_length=len(episode_rewards), 
                     step=(steps_COUNT, self.max_steps),
-                    other_metrics={"gd_steps": steps_GD}
+                    other_metrics={"gd_steps": steps_GD, __name__: self.envs.spec.id}
                 )
                 episodes_COUNT += 1
                 episode_rewards.clear()

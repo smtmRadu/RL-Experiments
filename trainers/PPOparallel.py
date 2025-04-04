@@ -16,7 +16,8 @@ import torch.nn.functional as F
 from flashml.tools.rl import log_episode, display_episodes
 from torch.optim.lr_scheduler import LinearLR
 from optimi import StableAdamW
-
+import random
+import numpy as np
 
 class PPO():
     '''
@@ -47,10 +48,17 @@ class PPO():
         assert buffer_size % batch_size == 0, f"Batch size must divide buffer size (recv: {buffer_size} and {num_envs})"
         assert buffer_size % num_envs == 0, f"Num envs must divide buffer size (recv: {buffer_size} and {num_envs})"
 
-        torch.backends.cudnn.benchmark = True
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        torch.manual_seed(seed=seed)
-        torch.cuda.manual_seed_all(seed=seed)
+        self.device = "cpu"
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        random.seed(seed)   
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False  
+        torch.backends.cudnn.deterministic = True
 
         self.envs = gym.make_vec(env_name, num_envs=num_envs)
     
@@ -164,7 +172,7 @@ class PPO():
                             sum(episode_rewards[idx]), 
                             episode_length=len(episode_rewards[idx]), 
                             step=(steps_COUNT, self.max_steps),
-                            other_metrics= {"Policy LR" : self.lr_scheduler_pi.get_last_lr(), "Value LR" : self.lr_scheduler_v.get_last_lr()}
+                            other_metrics= {"Policy LR" : self.lr_scheduler_pi.get_last_lr(), "Value LR" : self.lr_scheduler_v.get_last_lr(), __name__: self.envs.spec.id}
                         )
                         episodes_COUNT += 1
                         episode_rewards[idx].clear()

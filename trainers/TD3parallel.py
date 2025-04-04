@@ -11,12 +11,9 @@ from networks.q import Q
 import torch
 import torch.nn.functional as F
 from flashml.tools.rl import log_episode, display_episodes
-from flashml.tools import log_metrics2
 from optimi import StableAdamW
 import random
-import numpy as np  
-
-
+import numpy as np
 class Buffer:
     def __init__(self, max_size, state_dim, action_dim):
         self.s = torch.zeros(max_size, state_dim, requires_grad=False)
@@ -42,10 +39,11 @@ class Buffer:
         idx = torch.randint(0, self.count, (batch_size,))
         return self.s[idx], self.a[idx], self.r[idx], self.s_[idx], self.d[idx]
 
-class DDPG():
+class TD3():
     def __init__(
             self,
             env_name:str,
+            
             num_envs:int = 8,
             seed:int=0,
             max_steps:int=1e6,
@@ -53,7 +51,10 @@ class DDPG():
 
             gamma:float=0.99,        
             lr:float=1e-3,   
-            act_noise=0.1,
+            act_noise=0.1, # used on inference
+            target_noise = 0.2, # used on target actions computation
+            noise_clip =0.5,
+            policy_delay = 2,
             tau:float=0.005,
             init_steps=1000, # steps without updates
             update_every = 50,
@@ -75,36 +76,49 @@ class DDPG():
 
         self.envs = gym.make_vec(env_name, num_envs=num_envs)
 
-        assert isinstance(self.envs.action_space, gym.spaces.Box), "DDPG works only in continuous action spaces"
+        assert isinstance(self.envs.action_space, gym.spaces.Box), "SAC works only in continuous action spaces"
 
         self.action_range:tuple = (torch.tensor(self.envs.action_space.low, dtype=torch.float32, device=self.device), 
                                 torch.tensor(self.envs.action_space.high, dtype=torch.float32, device=self.device))
+                    
         self.action_scale = (self.action_range[1] - self.action_range[0]) / 2
         self.state_dim = self.envs.observation_space.shape[-1]
         self.action_dim = self.envs.action_space.shape[-1]
         
-        self.pi = Policy(self.state_dim, self.action_dim, "deterministic", networks_dimensions[0], networks_dimensions[1]).to(self.device)
-        self.q = Q(self.state_dim, self.action_dim, networks_dimensions[0], networks_dimensions[1]).to(self.device)
-        self.target_pi = Policy(self.state_dim, self.action_dim, "deterministic", networks_dimensions[0], networks_dimensions[1]).to(self.device)
-        self.target_q = Q(self.state_dim, self.action_dim, networks_dimensions[0], networks_dimensions[1]).to(self.device)
-        #set targ params to equal main params
-        self.target_pi.load_state_dict(self.pi.state_dict())
-        self.target_q.load_state_dict(self.q.state_dict())
+        
 
+        self.pi = Policy(self.state_dim, self.action_dim, "deterministic", networks_dimensions[0], networks_dimensions[1]).to(self.device)
+        self.q1 = Q(self.state_dim, self.action_dim, networks_dimensions[0], networks_dimensions[1]).to(self.device)
+        self.q2 = Q(self.state_dim, self.action_dim, networks_dimensions[0], networks_dimensions[1]).to(self.device)
+        self.target_pi = Policy(self.state_dim, self.action_dim, "deterministic", networks_dimensions[0], networks_dimensions[1]).to(self.device)
+        self.target_q1 = Q(self.state_dim, self.action_dim, networks_dimensions[0], networks_dimensions[1]).to(self.device)
+        self.target_q2 = Q(self.state_dim, self.action_dim, networks_dimensions[0], networks_dimensions[1]).to(self.device)
+        
         if not isinstance(self.pi.net[-1], torch.nn.Tanh):
             self.pi.net.append(torch.nn.Tanh())
             self.target_pi.net.append(torch.nn.Tanh())
 
-
         #set targ params to equal main params
         self.target_pi.load_state_dict(self.pi.state_dict())
-        self.target_q.load_state_dict(self.q.state_dict())
+        self.target_q1.load_state_dict(self.q1.state_dict())
+        self.target_q2.load_state_dict(self.q2.state_dict())
+
+
+        for param in self.target_pi.parameters():
+            param.requires_grad = False
+        for param in self.target_q1.parameters():
+            param.requires_grad = False
+        for param in self.target_q2.parameters():
+            param.requires_grad = False
 
         self.pi_optim = StableAdamW(self.pi.parameters(), lr=lr, weight_decay=0)
-        self.q_optim = StableAdamW(self.q.parameters(), lr=lr, weight_decay=0)
+        self.q1q2_optim = StableAdamW([*self.q1.parameters(), *self.q2.parameters()], lr=lr, weight_decay=0)
         self.max_steps = max_steps
         self.gamma = gamma
-        self.epsilon=act_noise
+        self.noise_clip = noise_clip
+        self.sigma_targ_act_noise = target_noise
+        self.policy_delay = policy_delay
+        self.eps_act_noise=act_noise
         self.tau = tau
         self.init_steps = init_steps
         self.batch_size = batch_size
@@ -125,7 +139,7 @@ class DDPG():
         while steps_COUNT < self.max_steps:
             with torch.no_grad(): 
                 mu_t = self.pi.forward(state_batch.to(self.device))
-                eps = torch.randn_like(mu_t, device=self.device) * self.epsilon
+                eps = torch.randn_like(mu_t, device=self.device) * self.eps_act_noise
                 # eps = torch.tensor(self.ou_noise.sample(), dtype=torch.float32).to(self.device).reshape(self.envs.num_envs, -1)
                 actions_batch = (mu_t + eps).detach().clip_(-1, 1)
 
@@ -174,39 +188,43 @@ class DDPG():
             r = r.to(self.device)
             s_prime = s_prime.to(self.device)
             d = d.to(self.device)
-        
-            # Compute targets for q functions ----------------------------------------------------------------------------------------------------
+
+            # Compute target actions &  targets for q functions ----------------------------------------------------------------------------------------------------
             with torch.no_grad():
-                mu_s_prime = self.target_pi(s_prime)
-                q_qtarg = self.target_q.forward(s_prime, mu_s_prime)
-                y = r + self.gamma * (1 - d) * q_qtarg
+                eps = torch.randn(self.batch_size, self.action_dim, device=self.device) * self.sigma_targ_act_noise
+                a_prime_s_prime = torch.clip(self.target_pi(s_prime) + torch.clip(eps, -self.noise_clip, self.noise_clip), -1, 1)
+                y = r + self.gamma * (1 - d) * \
+                    (torch.min(self.target_q1(s_prime, a_prime_s_prime), self.target_q2(s_prime,a_prime_s_prime)))
 
             # Update Q functions----------------------------------------------------------------------------------------------------
-            self.q.train()
-            q_loss = (self.q(s, a) - y)**2
-            self.q_optim.zero_grad()
-            q_loss.mean().backward()
-            self.q_optim.step()
+            self.q1.train()
+            self.q2.train()
+            q_loss = ((self.q1(s, a) - y)**2).mean() + ((self.q2(s, a) - y)**2).mean()
+            self.q1q2_optim.zero_grad()
+            q_loss.backward()
+            self.q1q2_optim.step()
 
             # Update PI function-----------------------------------------------------------------------------------------------------
-            self.q.eval()
-            mu_s = self.pi(s)
-            pi_loss = self.q(s, mu_s)
-            self.pi_optim.zero_grad()
-            (-pi_loss.mean()).backward()
-            self.pi_optim.step()
-     
-            # smooth update of target networks
-            with torch.no_grad():
-                for targ_pi_param, pi_param in zip(self.target_pi.parameters(), self.pi.parameters()):
-                    targ_pi_param.data.copy_(self.tau * pi_param.data + (1 - self.tau) * targ_pi_param.data)
+            if steps_GD % self.policy_delay == 0:
+                self.q1.eval()
+                self.q2.eval()
+                pi_loss = -self.q1(s, self.pi(s))
+                self.pi_optim.zero_grad()
+                pi_loss.mean().backward()
+                self.pi_optim.step()
 
-                for targ_q_param, q_param in zip(self.target_q.parameters(), self.q.parameters()):
-                    targ_q_param.data.copy_(self.tau * q_param.data + (1 - self.tau) * targ_q_param.data)
+                # smooth update of target networks
+                with torch.no_grad():
+                    for pitarg_param, pi_param in zip(self.target_pi.parameters(), self.pi.parameters()):
+                        pitarg_param.data.copy_(self.tau * pi_param.data + (1 - self.tau) * pitarg_param.data)
+
+                    for qtarg_param, q_param in zip(self.target_q1.parameters(), self.q1.parameters()):
+                        qtarg_param.data.copy_(self.tau * q_param.data + (1 - self.tau) * qtarg_param.data)
+
+                    for qtarg_param, q_param in zip(self.target_q2.parameters(), self.q2.parameters()):
+                        qtarg_param.data.copy_(self.tau * q_param.data + (1 - self.tau) * qtarg_param.data)
                    
-
                 
-
         print()
         self._make_checkpoint()
         display_episodes()
@@ -225,11 +243,13 @@ class DDPG():
         torch.save(
             {
                 "pi":self.pi,
-                "q": self.q,
+                "q1": self.q1,
+                "q2": self.q2,
                 "pi_optim":self.pi_optim,
-                "q_optim":self.q_optim,
+                "q1q2_optim":self.q1q2_optim,
             },
-            f= f"./checkpoints/{__name__}/{self.envs.spec.id}/checkpoint_{ckp_code}.pth")
+            f= f"./checkpoints/{__name__}/{self.envs.spec.id}/checkpoint_{ckp_code}.pth"
+        )
         print(f"Checkpoint {ckp_code} saved (./checkpoints/{__name__}/{self.envs.spec.id})")
 
     def _load_checkpoint(self):
@@ -252,12 +272,15 @@ class DDPG():
         checkpoint_path = os.path.join(path, latest_checkpoint)
         checkpoint = torch.load(checkpoint_path, weights_only=False)
         self.pi = checkpoint["pi"]
-        self.q = checkpoint["q"]
+        self.q1 = checkpoint["q1"]
+        self.q2 = checkpoint["q2"]
         self.pi_optim = checkpoint["pi_optim"]
-        self.q_optim = checkpoint["q_optim"]
+        self.q1q2_optim = checkpoint["q1q2_optim"]
         print(f"Checkpoint loaded: ({latest_checkpoint})")
 
         for param in self.target_pi.parameters():
                 param.requires_grad = False
-        for param in self.target_q.parameters():
+        for param in self.target_q1.parameters():
+            param.requires_grad = False
+        for param in self.target_q2.parameters():
             param.requires_grad = False

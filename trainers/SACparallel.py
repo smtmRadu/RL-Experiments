@@ -17,9 +17,8 @@ from flashml.tools.rl import log_episode, display_episodes
 from typing import List, Tuple
 from optimi import StableAdamW
 import math
-
-# rules
-# trains until buffer is full
+import random
+import numpy as np
 
 class Buffer:
     def __init__(self, max_size, state_dim, action_dim):
@@ -29,9 +28,12 @@ class Buffer:
         self.s_ = torch.zeros(max_size, state_dim, requires_grad=False)
         self.d = torch.zeros(max_size, 1, requires_grad=False)
         self.count = 0
+        self.max_size = max_size
 
     def add(self, s, a, r, s_, d):
         batch_size = s.shape[0]
+        if batch_size + self.count <= self.max_size:
+            pass
         self.s[self.count:self.count+batch_size] = s
         self.a[self.count:self.count+batch_size] = a
         self.r[self.count:self.count+batch_size] = r
@@ -42,7 +44,6 @@ class Buffer:
     def sample_batch(self, batch_size):
         idx = torch.randint(0, self.count, (batch_size,))
         return self.s[idx], self.a[idx], self.r[idx], self.s_[idx], self.d[idx]
-
 
 class SAC():
     def __init__(
@@ -63,10 +64,17 @@ class SAC():
             state_clipping = 5.0,       
     ):
         assert batch_size < init_steps * 5, "You must collect steps at first before updating policy"
-        torch.backends.cudnn.benchmark = True
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        torch.manual_seed(seed=seed)
-        torch.cuda.manual_seed_all(seed=seed)
+        self.device = "cpu"
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        random.seed(seed)   
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False  
+        torch.backends.cudnn.deterministic = True
 
         self.envs = gym.make_vec(env_name, num_envs=num_envs)
 
@@ -155,7 +163,7 @@ class SAC():
                         sum(episode_rewards[idx]), 
                         episode_length=len(episode_rewards[idx]), 
                         step=(steps_COUNT, self.max_steps),
-                        other_metrics={"gd_steps": steps_GD}
+                        other_metrics={"gd_steps": steps_GD, __name__: self.envs.spec.id}
                     )
                     episodes_COUNT += 1
                     episode_rewards[idx].clear()
@@ -190,7 +198,7 @@ class SAC():
                 a_tilde_prime = F.tanh(u_prime)
                 log_prob = _dist.log_prob(u_prime).sum(-1) - torch.sum(2 * (math.log(2) - u_prime - F.softplus(-2*u_prime)), dim=-1)
                 y = r + self.gamma * (1 - d) * \
-                    (torch.min(self.target_q1(s_prime, a_tilde_prime), self.target_q2(s_prime,a_tilde_prime)) - self.alpha * log_prob)
+                    (torch.minimum(self.target_q1(s_prime, a_tilde_prime), self.target_q2(s_prime,a_tilde_prime)) - self.alpha * log_prob)
 
             # Update Q functions----------------------------------------------------------------------------------------------------
             self.q1.train()
@@ -210,7 +218,7 @@ class SAC():
             u = _dist.rsample()
             a = torch.tanh(u)
             log_pi_as =  _dist.log_prob(u).sum(-1) - torch.sum(2*(math.log(2) - u - F.softplus(-2*u)), dim=-1)
-            pi_loss = torch.min(self.q1(s, a), self.q2(s, a)) - self.alpha * log_pi_as
+            pi_loss = torch.minimum(self.q1(s, a), self.q2(s, a)) - self.alpha * log_pi_as
 
             self.pi_optim.zero_grad()
             (-pi_loss).mean().backward()
